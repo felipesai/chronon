@@ -26,8 +26,9 @@ with open(os.path.join(current_dir, "requirements/base.in"), "r") as infile:
     basic_requirements = [line for line in infile]
 
 
-__version__ = "local"
+__version__ = "1.0.0"
 __branch__ = "main"
+
 def get_version():
     version_str = os.environ.get("CHRONON_VERSION_STR", __version__)
     branch_str = os.environ.get("CHRONON_BRANCH_STR", __branch__)

@@ -569,7 +569,9 @@ class Join(joinConf: api.Join,
   private def findUnfilledRecords(bootstrapDfWithStats: DfWithStats,
                                   coveringSets: Seq[CoveringSet]): Option[DfWithStats] = {
     val bootstrapDf = bootstrapDfWithStats.df
-    if (coveringSets.isEmpty || !bootstrapDf.columns.contains(Constants.MatchedHashes)) {
+    // TODO: implement hashes with labels for BigQuery
+    //  if (coveringSets.isEmpty || !bootstrapDf.columns.contains(Constants.MatchedHashes)) {
+    if (true) {
       // this happens whether bootstrapParts is NULL for the JOIN and thus no metadata columns were created
       return Some(bootstrapDfWithStats)
     }

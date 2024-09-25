@@ -44,17 +44,18 @@ object SparkSessionBuilder {
     }
     val userName = Properties.userName
     val warehouseDir = localWarehouseLocation.map(expandUser).getOrElse(DefaultWarehouseDir.getAbsolutePath)
+    // TODO: set configs based on warehouse type
     var baseBuilder = SparkSession
       .builder()
       .appName(name)
       .enableHiveSupport()
       .config("spark.sql.session.timeZone", "UTC")
       //otherwise overwrite will delete ALL partitions, not just the ones it touches
-      .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
-      .config("hive.exec.dynamic.partition", "true")
-      .config("hive.exec.dynamic.partition.mode", "nonstrict")
-      .config("spark.sql.catalogImplementation", "hive")
-      .config("spark.hadoop.hive.exec.max.dynamic.partitions", 30000)
+      .config("spark.sql.sources.partitionOverwriteMode", "DYNAMIC")
+//      .config("hive.exec.dynamic.partition", "true")
+//      .config("hive.exec.dynamic.partition.mode", "nonstrict")
+//      .config("spark.sql.catalogImplementation", "hive")
+//      .config("spark.hadoop.hive.exec.max.dynamic.partitions", 30000)
       .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
     // Staging queries don't benefit from the KryoSerializer and in fact may fail with buffer underflow in some cases.

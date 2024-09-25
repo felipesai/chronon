@@ -7,5 +7,11 @@ object Constants {
   val mongoValue = "valueBytes"
   val mongoTs = "ts"
   val mongoDatabase = "chronon"
-  val mongoLoggingCollection = "logging"
+  val mongoLoggingCollection = "logs"
+  val bigtableKey = "key_bytes"
+  val bigtableValue = "value_bytes"
+  val bigtableTs = "ts"
+  val bigtableDatabase = "chronon"
+  val bigtableLogTable = "logs"
+  val bigtableColumnFamily = "data"
 }

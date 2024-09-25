@@ -59,7 +59,7 @@ object Driver {
   @transient lazy val logger = LoggerFactory.getLogger(getClass)
 
   def parseConf[T <: TBase[_, _]: Manifest: ClassTag](confPath: String): T =
-    ThriftJsonCodec.fromJsonFile[T](confPath, check = true)
+    ThriftJsonCodec.fromGCS[T](confPath, check = true)
 
   trait JoinBackfillSubcommand {
     this: ScallopConf =>

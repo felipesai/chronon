@@ -21,6 +21,7 @@ import ai.chronon.api.Extensions.StringsOps
 import com.fasterxml.jackson.databind.{DeserializationFeature, JsonNode, ObjectMapper}
 import org.apache.thrift.protocol.{TCompactProtocol, TSimpleJSONProtocol}
 import org.apache.thrift.{TBase, TDeserializer, TSerializer}
+import com.google.cloud.storage.{Blob, BlobId, Storage, StorageOptions}
 
 import java.util
 import java.util.Base64
@@ -94,6 +95,14 @@ object ThriftJsonCodec {
     val jsonStr =
       try src.mkString
       finally src.close()
+    val obj: T = fromJsonStr[T](jsonStr, check, clazz = implicitly[ClassTag[T]].runtimeClass.asInstanceOf[Class[T]])
+    obj
+  }
+
+  def fromGCS[T <: TBase[_, _]: Manifest: ClassTag](confPath: String, check: Boolean): T = {
+    val storage: Storage = StorageOptions.getDefaultInstance.getService
+    val blob = storage.get("chronon-artifacts", confPath)
+    val jsonStr = new String(blob.getContent())
     val obj: T = fromJsonStr[T](jsonStr, check, clazz = implicitly[ClassTag[T]].runtimeClass.asInstanceOf[Class[T]])
     obj
   }

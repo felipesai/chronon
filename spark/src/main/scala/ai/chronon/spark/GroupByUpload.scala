@@ -234,8 +234,7 @@ object GroupByUpload {
       .withColumn("ds", lit(endDs))
       .saveUnPartitioned(groupByConf.metaData.uploadTable, groupByConf.metaData.tableProps)
 
-    val kvDfReloaded = tableUtils.sparkSession
-      .table(groupByConf.metaData.uploadTable)
+    val kvDfReloaded = tableUtils.sql(s"select * from ${groupByConf.metaData.uploadTable}")
       .where(not(col("key_json").eqNullSafe(Constants.GroupByServingInfoKey)))
 
     val metricRow =

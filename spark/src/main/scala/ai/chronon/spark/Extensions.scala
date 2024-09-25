@@ -80,7 +80,7 @@ object Extensions {
   object DfWithStats {
     def apply(dataFrame: DataFrame)(implicit tableUtils: TableUtils): DfWithStats = {
       val partitionCounts = dataFrame
-        .groupBy(col(TableUtils(dataFrame.sparkSession).partitionColumn))
+        .groupBy(col(TableUtils(dataFrame.sparkSession).partitionColumn).cast("String"))
         .count()
         .collect()
         .map(row => row.getString(0) -> row.getLong(1))

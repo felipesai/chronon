@@ -40,6 +40,8 @@ import scala.collection.{Seq, mutable}
 import scala.collection.immutable
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
 import scala.util.{Failure, Success, Try}
+import redis.clients.jedis.Jedis
+import scala.jdk.CollectionConverters._
 
 case class TableUtils(sparkSession: SparkSession) {
   @transient lazy val logger = LoggerFactory.getLogger(getClass)
@@ -83,9 +85,18 @@ case class TableUtils(sparkSession: SparkSession) {
   val aggregationParallelism: Int = sparkSession.conf.get("spark.chronon.group_by.parallelism", "1000").toInt
   val maxWait: Int = sparkSession.conf.get("spark.chronon.wait.hours", "48").toInt
 
-  sparkSession.sparkContext.setLogLevel("ERROR")
-  // converts String-s like "a=b/c=d" to Map("a" -> "b", "c" -> "d")
+  val sqlFormat: String = sparkSession.conf.get("spark.chronon.sql.format", "parquet")
 
+  val redisHost: String = sparkSession.conf.get("spark.chronon.redis.host", "localhost")
+
+  sparkSession.sparkContext.setLogLevel("INFO")
+
+  if(sqlFormat == "bigquery") {
+    sparkSession.conf.set("materializationDataset", sparkSession.conf.get("spark.materializationDataset"))
+    sparkSession.conf.set("viewsEnabled", "true")
+  }
+  // converts String-s like "a=b/c=d" to Map("a" -> "b", "c" -> "d")
+  
   def preAggRepartition(df: DataFrame): DataFrame =
     if (df.rdd.getNumPartitions < aggregationParallelism) {
       df.repartition(aggregationParallelism)
@@ -109,7 +120,18 @@ case class TableUtils(sparkSession: SparkSession) {
       .toMap
   }
 
-  def tableExists(tableName: String): Boolean = sparkSession.catalog.tableExists(tableName)
+  def tableExists(tableName: String): Boolean = {
+    try {
+      getSchemaFromTable(tableName)
+      true
+    } catch {
+      case e: Exception => {
+        logger.info(s"Error message received when trying to get schema from table $tableName")
+        logger.info(s"Assuming table $tableName does not exist")
+        false
+      }
+    }
+  }
 
   def loadEntireTable(tableName: String): DataFrame = sparkSession.table(tableName)
 
@@ -165,6 +187,11 @@ case class TableUtils(sparkSession: SparkSession) {
       }
       return getIcebergPartitions(tableName)
     }
+
+    if(sqlFormat == "bigquery") {
+      return getBigQueryPartitions(tableName, subPartitionsFilter, partitionColumn)
+    }
+    
     sparkSession.sqlContext
       .sql(s"SHOW PARTITIONS $tableName")
       .collect()
@@ -217,6 +244,29 @@ case class TableUtils(sparkSession: SparkSession) {
     }
   }
 
+  private def getBigQueryPartitions(tableName: String, subPartitionsFilter: Map[String, String] = Map.empty, partitionColumn: String = "ds"): Seq[String] = {
+    val dataset = tableName.split("\\.")(0)
+    val tableNameSuffix = tableName.split("\\.")(1)
+
+    val getPartitionsSql = s"""SELECT CAST(PARSE_DATE('%Y%m%d', partition_id) AS STRING) as $partitionColumn
+                           | FROM $dataset.INFORMATION_SCHEMA.PARTITIONS
+                           | WHERE TABLE_SCHEMA = '$dataset'
+                           | AND TABLE_NAME = '$tableNameSuffix'
+                           | AND partition_id != '__NULL__'
+                           | ORDER BY partition_id""".stripMargin
+
+    logger.info(s"getPartitionsSql: $getPartitionsSql")
+    val partitionsDf = sparkSession.read.format("bigquery").option("query", getPartitionsSql).load()
+    
+    logger.info(s"Detected ${partitionsDf.count()} partitions for table $tableName")
+
+    partitionsDf
+      .select(partitionColumn)
+      .collect()
+      .map(_.getString(0))
+      .toSeq
+  }
+
   // Given a table and a query extract the schema of the columns involved as input.
   def getColumnsFromQuery(query: String): Seq[String] = {
     val parser = sparkSession.sessionState.sqlParser
@@ -252,7 +302,8 @@ case class TableUtils(sparkSession: SparkSession) {
   }
 
   def getSchemaFromTable(tableName: String): StructType = {
-    sparkSession.sql(s"SELECT * FROM $tableName LIMIT 1").schema
+    val query = s"SELECT * FROM $tableName LIMIT 1"
+    sparkSession.read.format(sqlFormat).option("query", query).load().schema
   }
 
   // method to check if a user has access to a table
@@ -263,7 +314,8 @@ case class TableUtils(sparkSession: SparkSession) {
     try {
       // retrieve one row from the table
       val partitionFilter = lastAvailablePartition(tableName).getOrElse(fallbackPartition)
-      sparkSession.sql(s"SELECT * FROM $tableName where $partitionColumn='$partitionFilter' LIMIT 1").collect()
+      val query = s"SELECT * FROM $tableName where $partitionColumn='$partitionFilter' LIMIT 1"
+      sparkSession.read.format(sqlFormat).option("query", query).load().collect()
       true
     } catch {
       case e: SparkException =>
@@ -287,6 +339,21 @@ case class TableUtils(sparkSession: SparkSession) {
   def firstAvailablePartition(tableName: String, subPartitionFilters: Map[String, String] = Map.empty): Option[String] =
     partitions(tableName, subPartitionFilters).reduceOption((x, y) => Ordering[String].min(x, y))
 
+  def createBigQueryTable(tableName: String, schema: StructType, partitionColumns: Seq[String]): Unit = {
+    logger.info("Creating bigquery table")
+    var df = sparkSession.createDataFrame(sparkSession.sparkContext.emptyRDD[Row], schema)
+
+    df = df.withColumn(partitionColumn, to_date(col(partitionColumn), partitionFormat))
+
+    df.write
+      .format("bigquery")
+      .option("table", tableName)
+      .option("temporaryGcsBucket","chronon-tmp")
+      .option("partitionField", partitionColumn)
+      .option("partitionType", "DAY")
+      .save()
+  }
+
   def insertPartitions(df: DataFrame,
                        tableName: String,
                        tableProperties: Map[String, String] = null,
@@ -305,22 +372,30 @@ case class TableUtils(sparkSession: SparkSession) {
     }
 
     if (!tableExists(tableName)) {
-      val creationSql = createTableSql(tableName, dfRearranged.schema, partitionColumns, tableProperties, fileFormat)
-      try {
-        sql(creationSql)
-      } catch {
-        case _: TableAlreadyExistsException =>
-          logger.info(s"Table $tableName already exists, skipping creation")
-        case e: Exception =>
-          logger.error(s"Failed to create table $tableName", e)
-          throw e
+      if (sqlFormat == "bigquery") {
+        createBigQueryTable(tableName, dfRearranged.schema, partitionColumns)
+      }
+      else {
+        val creationSql = createTableSql(tableName, dfRearranged.schema, partitionColumns, tableProperties, fileFormat)
+        try {
+          sql(creationSql)
+        } catch {
+          case _: TableAlreadyExistsException =>
+            logger.info(s"Table $tableName already exists, skipping creation")
+          case e: Exception =>
+            logger.error(s"Failed to create table $tableName", e)
+            throw e
+        }
       }
     }
+
+    // TODO: implement table properties in BigQuery
+
     if (tableProperties != null && tableProperties.nonEmpty) {
       alterTableProperties(tableName, tableProperties)
     }
 
-    if (autoExpand) {
+    if (autoExpand && sqlFormat != "bigquery") {
       expandTable(tableName, dfRearranged.schema)
     }
 
@@ -340,6 +415,7 @@ case class TableUtils(sparkSession: SparkSession) {
       // so that an exception will be thrown below
       dfRearranged
     }
+
     repartitionAndWrite(finalizedDf, tableName, saveMode, stats, sortByCols)
   }
 
@@ -359,7 +435,7 @@ case class TableUtils(sparkSession: SparkSession) {
       s"\n----[Running query coalesced into at most $partitionCount partitions]----\n$query\n----[End of Query]----\n\n Query call path (not an error stack trace): \n$stackTraceStringPretty \n\n --------")
     try {
       // Run the query
-      val df = sparkSession.sql(query).coalesce(partitionCount)
+      val df = sparkSession.read.format(sqlFormat).option("query", query).load().coalesce(partitionCount)
       df
     } catch {
       case e: AnalysisException if e.getMessage.contains(" already exists") =>
@@ -378,7 +454,12 @@ case class TableUtils(sparkSession: SparkSession) {
                           fileFormat: String = "PARQUET"): Unit = {
 
     if (!tableExists(tableName)) {
-      sql(createTableSql(tableName, df.schema, Seq.empty[String], tableProperties, fileFormat))
+      if (sqlFormat == "bigquery") {
+        createBigQueryTable(tableName, df.schema, Seq.empty[String])
+      }
+      else {
+        sql(createTableSql(tableName, df.schema, Seq.empty[String], tableProperties, fileFormat))
+      }
     } else {
       if (tableProperties != null && tableProperties.nonEmpty) {
         alterTableProperties(tableName, tableProperties)
@@ -470,7 +551,7 @@ case class TableUtils(sparkSession: SparkSession) {
 
       val totalFileCountEstimate = math.ceil(rowCount * columnSizeEstimate / rowCountPerPartition).toInt
       val dailyFileCountUpperBound = 2000
-      val dailyFileCountLowerBound = if (isLocal) 1 else 10
+      val dailyFileCountLowerBound = if (isLocal) 1 else 2
       val dailyFileCountEstimate = totalFileCountEstimate / nonZeroTablePartitionCount + 1
       val dailyFileCountBounded =
         math.max(math.min(dailyFileCountEstimate, dailyFileCountUpperBound), dailyFileCountLowerBound)
@@ -497,14 +578,32 @@ case class TableUtils(sparkSession: SparkSession) {
           (Seq(partitionColumn, saltCol), Seq(partitionColumn) ++ sortByCols)
         } else { (Seq(saltCol), sortByCols) }
       logger.info(s"Sorting within partitions with cols: $partitionSortCols")
-      saltedDf
-        .repartition(shuffleParallelism, repartitionCols.map(saltedDf.col): _*)
-        .drop(saltCol)
-        .sortWithinPartitions(partitionSortCols.map(col): _*)
-        .write
-        .mode(saveMode)
-        .insertInto(tableName)
-      logger.info(s"Finished writing to $tableName")
+      
+      val repartitionedDf = saltedDf
+          .repartition(shuffleParallelism, repartitionCols.map(saltedDf.col): _*)
+          .drop(saltCol)
+          .sortWithinPartitions(partitionSortCols.map(col): _*)
+
+      if(sqlFormat == "bigquery") {
+
+        val bigqueryDf = repartitionedDf.withColumn(partitionColumn, to_date(col(partitionColumn), partitionFormat))
+
+        bigqueryDf
+          .write
+          .format("bigquery")
+//          .option("temporaryGcsBucket","chronon-tmp")
+          .option("writeMethod", "direct")
+//          .option("partitionField", partitionColumn)
+//          .option("partitionType", "DAY")
+          .mode(saveMode)
+          .save(tableName)
+      }
+      else {
+        repartitionedDf
+          .write
+          .mode(saveMode)
+          .insertInto(tableName)
+      }
     }
   }
 
@@ -529,10 +628,19 @@ case class TableUtils(sparkSession: SparkSession) {
     val partitionFragment = if (partitionColumns != null && partitionColumns.nonEmpty) {
       val partitionDefinitions = schema
         .filter(field => partitionColumns.contains(field.name))
-        .map(field => s"${field.name} ${field.dataType.catalogString}")
-      s"""PARTITIONED BY (
-         |    ${partitionDefinitions.mkString(",\n    ")}
-         |)""".stripMargin
+        .map(field => s"${field.name} ")
+      
+      if(sqlFormat == "bigquery") {
+        s"""PARTITION BY (
+           |    ${partitionDefinitions.mkString(",\n    ")}
+           |)""".stripMargin
+      }
+      else {
+        s"""PARTITIONED BY (
+           |    ${partitionDefinitions.mkString(",\n    ")}
+           |)""".stripMargin
+      }
+      
     } else {
       ""
     }
@@ -543,7 +651,7 @@ case class TableUtils(sparkSession: SparkSession) {
     } else {
       ""
     }
-    val fileFormatString = if (useIceberg) {
+    val fileFormatString = if (useIceberg || sqlFormat == "bigquery") {
       ""
     } else {
       s"STORED AS $fileFormat"
@@ -552,15 +660,36 @@ case class TableUtils(sparkSession: SparkSession) {
   }
 
   def alterTableProperties(tableName: String, properties: Map[String, String]): Unit = {
-    // Only SQL api exists for setting TBLPROPERTIES
-    val propertiesString = properties
-      .map {
-        case (key, value) =>
-          s"'$key' = '$value'"
+    if (sqlFormat == "bigquery") alterTablePropertiesRedis(tableName, properties)
+    else {
+      // Only SQL api exists for setting TBLPROPERTIES
+      val propertiesString = properties
+        .map {
+          case (key, value) =>
+            s"'$key' = '$value'"
+        }
+        .mkString(", ")
+      val query = s"ALTER TABLE $tableName SET TBLPROPERTIES ($propertiesString)"
+      sql(query)
+    }
+  }
+
+  def alterTablePropertiesRedis(tableName: String, properties: Map[String, String]): Unit = {
+    logger.info(s"Altering table properties with Redis, host: $redisHost")
+
+    val redisPort = 6379
+    val jedis = new Jedis(redisHost, redisPort)
+
+    try {
+      properties.foreach { case (key, value) =>
+        jedis.hset(tableName, key, value)
       }
-      .mkString(", ")
-    val query = s"ALTER TABLE $tableName SET TBLPROPERTIES ($propertiesString)"
-    sql(query)
+      println(s"Properties for table $tableName have been saved to Redis.")
+    } catch {
+      case e: Exception => println(s"An error occurred while saving to Redis: ${e.getMessage}")
+    } finally {
+      jedis.close()
+    }
   }
 
   def chunk(partitions: Set[String]): Seq[PartitionRange] = {
@@ -639,11 +768,37 @@ case class TableUtils(sparkSession: SparkSession) {
   }
 
   def getTableProperties(tableName: String): Option[Map[String, String]] = {
+    if (sqlFormat == "bigquery") getTablePropertiesRedis(tableName)
+    else {
+      try {
+        val tableId = sparkSession.sessionState.sqlParser.parseTableIdentifier(tableName)
+        Some(sparkSession.sessionState.catalog.getTempViewOrPermanentTableMetadata(tableId).properties)
+      } catch {
+        case _: Exception => None
+      }
+    }
+  }
+
+  def getTablePropertiesRedis(tableName: String): Option[Map[String, String]] = {
+    logger.info(s"Getting table properties with redis for table $tableName, redis host: $redisHost")
+
+    val redisPort = 6379
+    val jedis = new Jedis(redisHost, redisPort)
+
     try {
-      val tableId = sparkSession.sessionState.sqlParser.parseTableIdentifier(tableName)
-      Some(sparkSession.sessionState.catalog.getTempViewOrPermanentTableMetadata(tableId).properties)
+      val redisData = jedis.hgetAll(tableName)
+
+      if (redisData.isEmpty) {
+        None
+      } else {
+        Some(redisData.asScala.toMap)
+      }
     } catch {
-      case _: Exception => None
+      case e: Exception =>
+        println(s"An error occurred while fetching from Redis: ${e.getMessage}")
+        None
+    } finally {
+      jedis.close()
     }
   }
 
